@@ -70,6 +70,17 @@ class AutoDeps(object):
             return self.class_to_rule[c]
         return []
 
+    def _maybe_get_classes(self, target):
+        if "." in target and not ":" in target:
+            return set([target])
+        src_files = list(self._get_sources(target))
+        logger.info("Get sources %s", src_files)
+        all_classes = set()
+        for src in src_files:
+            for c in self._get_imports_from_file(src):
+                all_classes.add(c)
+        return all_classes
+
     def resolve(self, target):
         """Resolve dependencies for the given bazel target.
 
@@ -83,20 +94,23 @@ class AutoDeps(object):
         4. Merge all the resolved targets.
         5. Replace the target name with their alias if alias is set.
         """
-        src_files = list(self._get_sources(target))
-        logger.info("Get sources %s", src_files)
-        all_classes = set()
-        for src in src_files:
-            for c in self._get_imports_from_file(src):
-                all_classes.add(c)
+        all_classes = self._maybe_get_classes(target)
         logger.info("classes %s", all_classes)
-        deps = set()
+        # rule_name(that provides class) -> list of classes that need this rule.
+        deps = dict()
         for c in all_classes:
             for d in self._find_bazel_rule_for_class(c):
-                deps.add(d)
-        for d in sorted(deps):
+                if d in deps:
+                    deps[d].append(c)
+                else:
+                    deps[d] = [c]
+        # Check exports to find the right deps.
+        import pdb
+        # pdb.set_trace()
+        for d, classes in sorted(deps.items()):
             if d in self.rule_to_alias:
                 d = self.rule_to_alias[d]
+            print("# {}".format(" ".join(classes)))
             print('"{}",'.format(d))
 
 
@@ -108,7 +122,7 @@ def main():
         "target",
         type=str,
         default="//common:common",
-        help="Which bazel target to process."
+        help="Which bazel target(//foo:bar) or class(com.foo.Bar) to process."
     )
     parser.add_argument(
         "--db",
