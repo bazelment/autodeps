@@ -72,8 +72,8 @@ class BazelWrapper(object):
                                        universal_newlines=True,
                                        **kwargs)
 
-    def cquery(self, *args):
-        return self.check_output("cquery", *args)
+    def cquery(self, *args, **kwargs):
+        return self.check_output("cquery", *args, **kwargs)
 
     def get_deps_tree(self, target):
         return self.cquery("--noimplicit_deps",
@@ -97,7 +97,8 @@ class BazelWrapper(object):
         """Get the source files of the given target."""
         output = self.cquery(
             '--output=jsonproto',
-            'labels(srcs, {})'.format(target))
+            'labels(srcs, {})'.format(target),
+            stderr=subprocess.DEVNULL)
         l = json.loads(output)
         if "results" in l:
             for item in l["results"]:
@@ -105,6 +106,22 @@ class BazelWrapper(object):
                 if target["type"] == "SOURCE_FILE":
                     f = target["sourceFile"]["location"]
                     yield f.split(':')[0]
+
+    def get_outputs(self, target, suffix=None):
+        """Get the outputs of the given target.
+
+        If suffix is not None, only return the file with the given
+        suffix.
+        """
+        expr = "'\\n'.join([f.path for f in target.files.to_list()])"
+        cquery_output = self.cquery("--output=starlark",
+                                    "--starlark:expr",
+                                    expr, target, stderr=subprocess.DEVNULL)
+        files = cquery_output.strip().split("\n")
+        if suffix:
+            return [x for x in files if x.endswith(suffix)]
+        else:
+            return files
 
 
 class DepsParser(object):
@@ -114,6 +131,7 @@ class DepsParser(object):
         self.jvm_libs = dict()
         self.bazel = bazel_wrapper
         self.bazel_bin, self.output_base = self.bazel.get_info()
+        self.skipped_rule_classes = set()
         logger.info("bazel-bin: %s, output_base: %s", self.bazel_bin, self.output_base)
 
     def parse(self, deps_json):
@@ -127,15 +145,23 @@ class DepsParser(object):
             if rule["ruleClass"] == "alias":
                 attr = build_attributes_dict(rule)
                 a = rule["name"]
-                self.alias_map[attr["actual"]] = a
+                print("Alias {} -> {}".format(a, attr["actual"]))
+                self.alias_map[a] = attr["actual"]
             elif rule["ruleClass"] == "generic_scala_worker":
                 self._parse_scala_worker(rule)
             elif rule["ruleClass"] == "java_library":
                 self._parse_java_library(rule)
             elif rule["ruleClass"] == "java_import":
                 self._parse_java_import(rule)
+            elif rule["ruleClass"] in ["scala_proto_library", "jarjar_links"]:
+                self._parse_jar_generators(rule)
+            else:
+                self.skipped_rule_classes.add(rule["ruleClass"])
         # Get the list of classes from each rule
         self._scan_classes()
+
+    def report(self):
+        logger.info("Ignored these rule classes: %s", self.skipped_rule_classes)
 
     def _parse_scala_worker(self, rule):
         name = rule["name"]
@@ -155,8 +181,23 @@ class DepsParser(object):
                 if i.endswith("_deploy.jar"):
                     jar = i
                     break
+        jar = self._guess_jar_full_path(jar)
 
         self.jvm_libs[name] = JvmLib(name, [jar], attr.get("exports", None),
+                                     attr.get("visibility", None), [])
+
+    def _parse_jar_generators(self, rule):
+        """Get the output jars from the given rule.
+
+        Certain rules generate jar file(s) without declaring them as
+        output, ideally we should use JavaInfo provider to the
+        rule/target to get such information.
+        At the moment we just use `files` attribute.
+        """
+        name = rule["name"]
+        attr = build_attributes_dict(rule)
+        jars = self.bazel.get_outputs(name, suffix=".jar")
+        self.jvm_libs[name] = JvmLib(name, jars, attr.get("exports", None),
                                      attr.get("visibility", None), [])
 
     def _parse_java_library(self, rule):
@@ -168,87 +209,68 @@ class DepsParser(object):
             if i.endswith(".jar") and not i.endswith("-src.jar"):
                 jar = i
                 break
+        jar = self._guess_jar_full_path(jar)
         self.jvm_libs[name] = JvmLib(name, [jar], attr.get("exports", None),
                                      attr.get("visibility", None), [])
 
     def _parse_java_import(self, rule):
         name = rule["name"]
         attr = build_attributes_dict(rule)
-        self.jvm_libs[name] = JvmLib(name, attr.get("jars", []),
-                                     attr.get("exports", None),
-                                     attr.get("visibility", None), [])
+        jars = attr.get("jars", [])
+        # The jars of java_import could be jar file in the source
+        # tree, or output from another rule.
+        resolved_jars = []
+        if jars:
+            # First we use basic transformation to get the full path
+            # of each jars.
+            for jar in jars:
+                full_path = self._guess_jar_full_path(jar)
+                if full_path:
+                    resolved_jars.append(full_path)
+        if len(resolved_jars) != len(jars) or len(jars) == 0:
+            # Use expensive query to get jar paths
+            resolved_jars = self.bazel.get_outputs(name, suffix=".jar")
+        self.jvm_libs[name] = JvmLib(
+            name, resolved_jars,
+            attr.get("exports", None),
+            attr.get("visibility", None), [])
 
-    def _get_jar_location(self, jar, rule_name):
-        """Get the given jar's actual location on file system.
+    def _get_full_path_under_output(self, relative_path):
+        # logger.info("search %s", relative_path)
+        for prefix in [self.bazel.workspace, self.output_base, self.bazel_bin]:
+            p = os.path.join(prefix, relative_path)
+            logger.info("check %s", p)
+            if os.path.exists(p):
+                return p
+        return None
 
-        It performs a heuristic search the jar's rule name. If not
-        found, the jar might not been built, it will try to trigger
-        the rule's build operation and perform the same search again.
-
-        It will also query the srcs attribute of the jar to see
-        whether it can be found.
-        """
-        def _try_path(relative_path):
-            # logger.info("search %s", relative_path)
-            for prefix in [self.bazel.workspace, self.output_base, self.bazel_bin]:
-                p = os.path.join(prefix, relative_path)
-                logger.info("check %s", p)
-                if os.path.exists(p):
-                    return p
-            return None
-        def _guess_path_based_name():
-            # Start with basic transformation to get the jar location
-            if jar.startswith("//"):
-                # This is a rule inside the current workspace
-                jar_relative_path = jar.removeprefix("//").replace(":", "/")
-                gp = _try_path(jar_relative_path)
-                if gp:
-                    return gp
-            elif jar.startswith("@"):
-                # This is a rule from external repo, like '@scala_2_12//:lib/jline-2.14.6.jar'
-                gp = _try_path(os.path.join("external", jar.removeprefix("@").replace("//:", "/").replace("//", "/").replace(":", "/")))
-                if gp:
-                    return gp
-            return None
-        ret = _guess_path_based_name()
-        if ret:
-            return ret
-
-        # Use labels(src, target) to query it.
-        jar_files = list(self.bazel.get_sources(jar))
-        if len(jar_files) != 1:
-            logger.info("Failed to get source location of {}".format(jar))
-        else:
-            return jar_files[0]
-        # The above doesn't work for //maven-trees/grpc-netty:liball_deps_2.12.jar
-
-        logger.info("output file %s doesn't exist, try bazel build %s", jar, rule_name)
-        self.bazel.build(rule_name)
-        # Try again
-        ret = _guess_path_based_name()
-        if ret:
-            return ret
-        else:
-            raise ValueError("Can't find location of {}".format(jar))
-
-        # The rest doesn't seem to be necessary
-        """content of output_location.cquery:
-def format(target):
-  outputs = target.files.to_list()
-  return outputs[0].path if len(outputs) > 0 else "(missing)"
-        """
-        # output = self.bazel.check_output(
-        #     "cquery", "--output", "starlark",
-        #     "--starlark:file=output_location.cquery",
-        #     jar, stderr=subprocess.DEVNULL)
-        # jar_reported_by_bazel = output.strip()
-        # ret = _try_path(jar_reported_by_bazel)
-        # if not ret:
-        #     raise ValueError("Can't find location of {}".format(jar))
-        # return ret
+    def _guess_jar_full_path(self, jar):
+        # Start with basic transformation to get the jar location
+        if jar.startswith("//"):
+            # This is a rule inside the current workspace
+            jar_relative_path = jar.removeprefix("//").replace(":", "/")
+            gp = self._get_full_path_under_output(jar_relative_path)
+            if gp:
+                return gp
+        elif jar.startswith("@"):
+            # This is a rule from external repo, like '@scala_2_12//:lib/jline-2.14.6.jar'
+            gp = self._get_full_path_under_output(os.path.join("external", jar.removeprefix("@").replace("//:", "/").replace("//", "/").replace(":", "/")))
+            if gp:
+                return gp
+        elif jar.startswith("bazel-out"):
+            # These are the jars got from generators
+            gp = self._get_full_path_under_output(jar)
+            if gp:
+                return gp
+        return None
 
     def _record_classes_from_rule(self, rule, jar):
-        jar_file = self._get_jar_location(jar, rule.name)
+        # jar_file = self._get_jar_location(jar, rule.name)
+        # Some rule like java_import may have resolved the jar to full path already.
+        if os.path.isabs(jar):
+            jar_file = jar
+        else:
+            jar_file = self._get_full_path_under_output(jar)
         logger.info("jar is found in %s", jar_file)
         for c in get_class_names_from_jar(jar_file):
             rule.add_class(c)
@@ -296,7 +318,7 @@ class Indexer(object):
             self.bazel.build(self.seed_target)
             all_deps = self.bazel.get_deps_tree(self.seed_target)
             dep_parser.parse(all_deps)
-
+        dep_parser.report()
         output_file = os.path.expanduser(output)
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
         with gzip.open(output_file, "wt") as fp:
